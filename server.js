@@ -109,6 +109,33 @@ const flagBanner = (flag) => `
 const notice = (msg, ok) => !msg ? '' : `
 <div class="mb-4 rounded-lg border ${ok ? 'border-emerald-300 bg-emerald-50 text-emerald-800' : 'border-rose-300 bg-rose-50 text-rose-800'} px-4 py-2.5 text-sm">${esc(msg)}</div>`;
 
+// Send a full HTML page with an explicit status code. Every auth response below
+// renders inline (no 302 redirects), so the HTTP status *is* the signal: a
+// fuzzer can match on it directly (ffuf -mc / -fc) instead of parsing bodies.
+//
+//   200 ok · 201 created · 400 bad input · 401 unauthenticated/bad creds
+//   403 forbidden (wrong role) · 409 username taken · 429 rate-limited/locked
+const page = (res, status, title, body, me) => res.status(status).send(layout(title, body, me));
+
+function dashboardBody(me) {
+  const myNotes = store.notes.filter((n) => n.ownerId === me.id);
+  const notesHtml = myNotes.length
+    ? myNotes.map((n) => `<li class="rounded-lg border border-slate-200 bg-white p-4">
+        <div class="font-semibold">${esc(n.title)}</div>
+        <div class="text-slate-500 text-sm mt-1">${esc(n.body)}</div></li>`).join('')
+    : `<li class="text-slate-400 text-sm">No notes yet.</li>`;
+  // Proof-of-success: there is no legitimate route into bob's account, so
+  // seeing this page as bob means his password was cracked.
+  const flag = me.username === 'bob' ? flagBanner(store.FLAGS.bruteforce) : '';
+  return `
+  <div class="flex items-center justify-between">
+    <h1 class="text-2xl font-bold">Your notes</h1>
+    <span class="text-xs mono text-slate-400">signed in as ${esc(me.username)} · ${esc(me.role)}</span>
+  </div>
+  <ul class="mt-5 space-y-3">${notesHtml}</ul>
+  ${flag}`;
+}
+
 // --- routes ----------------------------------------------------------
 app.get('/', (req, res) => {
   const me = currentUser(req);
@@ -138,23 +165,35 @@ app.post('/register', (req, res) => {
     const now = Date.now();
     const rec = store.registerHits.get(ip) || { count: 0, until: 0 };
     if (now < rec.until) {
-      return res.redirect('/register?msg=' + encodeURIComponent('Too many attempts. Try again shortly.'));
+      return page(res, 429, 'Register', form('register', 'Too many attempts. Try again shortly.'), null);
     }
     rec.count += 1;
     if (rec.count >= 10) { rec.until = now + 60000; rec.count = 0; }
     store.registerHits.set(ip, rec);
+
+    // Do NOT confirm whether the username exists: identical 200 response
+    // whether taken or available, and no auto-login, so there is no oracle.
+    if (!username || !password) {
+      return page(res, 400, 'Register', form('register', 'Username and password are required.'), null);
+    }
+    if (!findUser(username)) {
+      store.users.push({
+        id: store.nextUserId++, username, password,
+        displayName: username, role: 'user', email: username + '@deaddrop.local',
+      });
+    }
+    return page(res, 200, 'Register',
+      form('register', 'If that username is available, your account has been created. Try signing in.', true), null);
   }
 
+  // VULNERABLE mode -----------------------------------------------------
   if (!username || !password) {
-    return res.redirect('/register?msg=' + encodeURIComponent('Username and password are required.'));
+    return page(res, 400, 'Register', form('register', 'Username and password are required.'), null);
   }
   if (findUser(username)) {
-    if (SECURE) {
-      // Do NOT confirm whether the username exists.
-      return res.redirect('/register?msg=' + encodeURIComponent('If that username is available, your account will be created. Check and try signing in.'));
-    }
-    // VULNERABLE: leaks that the username is taken -> enumeration primitive.
-    return res.redirect('/register?msg=' + encodeURIComponent('That username is already taken.'));
+    // Leaks that the username is taken -> enumeration primitive.
+    // 409 Conflict is the signal a fuzzer matches on (ffuf -mc 409).
+    return page(res, 409, 'Register', form('register', 'That username is already taken.'), null);
   }
   const user = {
     id: store.nextUserId++, username, password,
@@ -162,7 +201,7 @@ app.post('/register', (req, res) => {
   };
   store.users.push(user);
   startSession(res, user);
-  res.redirect('/dashboard');
+  return page(res, 201, 'Dashboard', dashboardBody(user), user);
 });
 
 // --- login (no rate limit = brute force) -----------------------------
@@ -179,58 +218,47 @@ app.post('/login', (req, res) => {
     const now = Date.now();
     const rec = store.loginFails.get(username) || { count: 0, until: 0 };
     if (now < rec.until) {
-      return res.redirect('/login?msg=' + encodeURIComponent('Account temporarily locked. Try again later.'));
+      // 429 = locked: the fuzzer is throttled, so brute-force stalls.
+      return page(res, 429, 'Sign in', form('login', 'Account temporarily locked. Try again later.'), null);
     }
     const user = findUser(username);
     if (!user || user.password !== password) {
       rec.count += 1;
       if (rec.count >= 5) { rec.until = now + 60000; rec.count = 0; }
       store.loginFails.set(username, rec);
-      return res.redirect('/login?msg=' + encodeURIComponent('Invalid credentials.'));
+      return page(res, 401, 'Sign in', form('login', 'Invalid credentials.'), null);
     }
     store.loginFails.delete(username);
     startSession(res, user);
-    return res.redirect('/dashboard');
+    return page(res, 200, 'Dashboard', dashboardBody(user), user);
   }
 
   // VULNERABLE: unlimited attempts, no delay, no lockout -> brute-forceable.
   // (Login error stays generic on purpose; enumeration is via /register.)
+  // 401 on failure, 200 on success -> ffuf -mc 200 (or -fc 401) finds the password.
   const user = findUser(username);
   if (!user || user.password !== password) {
-    return res.redirect('/login?msg=' + encodeURIComponent('Invalid credentials.'));
+    return page(res, 401, 'Sign in', form('login', 'Invalid credentials.'), null);
   }
   startSession(res, user);
-  res.redirect('/dashboard');
+  return page(res, 200, 'Dashboard', dashboardBody(user), user);
 });
 
 app.get('/logout', (req, res) => {
   if (SECURE && req.cookies.sid) store.sessions.delete(req.cookies.sid);
   res.clearCookie('sid');
-  res.redirect('/');
+  res.send(layout('Signed out', `
+  <section class="rounded-xl border border-slate-200 bg-white p-7 card text-center">
+    <h1 class="text-xl font-bold">You're signed out.</h1>
+    <a href="/login" class="inline-block mt-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold px-5 py-2.5">Sign in again</a>
+  </section>`, null));
 });
 
 // --- dashboard (bob's carries the brute-force flag) ------------------
 app.get('/dashboard', (req, res) => {
   const me = currentUser(req);
-  if (!me) return res.redirect('/login?msg=' + encodeURIComponent('Please sign in.'));
-  const myNotes = store.notes.filter((n) => n.ownerId === me.id);
-  const notesHtml = myNotes.length
-    ? myNotes.map((n) => `<li class="rounded-lg border border-slate-200 bg-white p-4">
-        <div class="font-semibold">${esc(n.title)}</div>
-        <div class="text-slate-500 text-sm mt-1">${esc(n.body)}</div></li>`).join('')
-    : `<li class="text-slate-400 text-sm">No notes yet.</li>`;
-
-  // Proof-of-success: there is no legitimate route into bob's account, so
-  // seeing this page as bob means his password was cracked.
-  const flag = me.username === 'bob' ? flagBanner(store.FLAGS.bruteforce) : '';
-
-  res.send(layout('Dashboard', `
-  <div class="flex items-center justify-between">
-    <h1 class="text-2xl font-bold">Your notes</h1>
-    <span class="text-xs mono text-slate-400">signed in as ${esc(me.username)} · ${esc(me.role)}</span>
-  </div>
-  <ul class="mt-5 space-y-3">${notesHtml}</ul>
-  ${flag}`, me));
+  if (!me) return page(res, 401, 'Sign in', form('login', 'Please sign in.'), null);
+  return page(res, 200, 'Dashboard', dashboardBody(me), me);
 });
 
 // --- members directory (ADMIN-ONLY — correct access control) ---------
@@ -240,10 +268,10 @@ app.get('/dashboard', (req, res) => {
 // the authentication way instead — via /register enumeration.
 app.get('/members', (req, res) => {
   const me = currentUser(req);
-  if (!me) return res.redirect('/login?msg=' + encodeURIComponent('Please sign in.'));
+  if (!me) return page(res, 401, 'Sign in', form('login', 'Please sign in.'), null);
   if (me.role !== 'admin') {
-    return res.status(403).send(layout('Members',
-      `<div class="rounded-xl border border-rose-200 bg-rose-50 p-6 text-rose-800">403 — the member directory is restricted to administrators.</div>`, me));
+    return page(res, 403, 'Members',
+      `<div class="rounded-xl border border-rose-200 bg-rose-50 p-6 text-rose-800">403 — the member directory is restricted to administrators.</div>`, me);
   }
 
   const rows = store.users.map((u) => `
@@ -264,9 +292,10 @@ app.get('/members', (req, res) => {
 // --- admin (forged-session flag) -------------------------------------
 app.get('/admin', (req, res) => {
   const me = currentUser(req);
-  if (!me || me.role !== 'admin') {
-    return res.status(403).send(layout('Admin',
-      `<div class="rounded-xl border border-rose-200 bg-rose-50 p-6 text-rose-800">403 — administrators only.</div>`, me));
+  if (!me) return page(res, 401, 'Sign in', form('login', 'Please sign in.'), null);
+  if (me.role !== 'admin') {
+    return page(res, 403, 'Admin',
+      `<div class="rounded-xl border border-rose-200 bg-rose-50 p-6 text-rose-800">403 — administrators only.</div>`, me);
   }
   res.send(layout('Admin', `
   <h1 class="text-2xl font-bold">Admin console</h1>

